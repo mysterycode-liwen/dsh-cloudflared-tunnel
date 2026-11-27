@@ -1,0 +1,3 @@
+- insert:
+    - id: cloudflared-tunnel
+      name: '@local/cloudflared-tunnel'
