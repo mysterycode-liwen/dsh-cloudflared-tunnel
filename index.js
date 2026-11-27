@@ -23,6 +23,21 @@ const DOWNLOADS = {
   darwin: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tpl',
   linux: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
 };
+// GitHub serves release binaries from release-assets.githubusercontent.com, which
+// some networks cannot reach at all: the TCP connect simply times out and fetch()
+// rejects with a bare "fetch failed". These mirrors proxy the very same release
+// URL, so the installer walks this list and uses the first one that delivers.
+const DOWNLOAD_SOURCES = [
+  (url) => url,
+  (url) => 'https://ghproxy.net/' + url,
+  (url) => 'https://gh-proxy.com/' + url,
+];
+// Remembering the last working mirror saves the user a connect-timeout on every
+// later install/upgrade: the winning source is tried first next time.
+const SOURCE_MEMO_PATH = path.join(CLOUDFLARED_CONFIG_DIR, '.download-source');
+const CONNECT_TIMEOUT_MS = 12_000;
+// A body that stops yielding bytes must fail instead of hanging the panel forever.
+const IDLE_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_BODY = 64 * 1024;
 const DEFAULT_TIMEOUT = 30_000;
@@ -36,6 +51,97 @@ const confirmations = new Map();
 let installProgress = null;
 // stamp each snapshot so the client can ignore a stale "done" from a prior run.
 function setProgress(obj) { installProgress = { ...obj, at: Date.now() }; }
+
+/** Turn a fetch/stream failure into something a user can act on. Node reports
+ *  blocked networks as a bare "fetch failed" whose real reason hides in `cause`. */
+function describeDownloadError(err) {
+  const cause = err && err.cause;
+  const code = (cause && (cause.code || cause.errno)) || '';
+  const detail = (cause && cause.message) || (err && err.message) || String(err);
+  if (/fetch failed/i.test(detail) && !code) return 'fetch failed（网络无法连接该源）';
+  return code ? code + ': ' + detail : detail;
+}
+
+/** Source order for one install: the mirror that worked last time goes first,
+ *  everything else keeps its declared order. */
+function downloadOrder() {
+  let remembered = -1;
+  try { remembered = parseInt(readFileSync(SOURCE_MEMO_PATH, 'utf8').trim(), 10); } catch {}
+  const indexes = DOWNLOAD_SOURCES.map((_, i) => i);
+  if (!Number.isInteger(remembered) || remembered < 0 || remembered >= indexes.length) return indexes;
+  return [remembered, ...indexes.filter((i) => i !== remembered)];
+}
+
+function rememberSource(index) {
+  try { writeFileSync(SOURCE_MEMO_PATH, String(index) + '\n', 'utf8'); } catch {}
+}
+
+/** Stream one download attempt to `part`, reporting byte progress. Rejects on a
+ *  connect timeout, a non-2xx status, an idle body, or a short body — so the
+ *  caller can move on to the next mirror instead of hanging the panel. */
+async function downloadTo(url, part, target) {
+  const controller = new AbortController();
+  const connectTimer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
+  let idleTimer = null;
+  const armIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
+  };
+  let out = null;
+  try {
+    armIdle();
+    const res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const total = parseInt(res.headers?.get?.('content-length') || '0', 10) || 0;
+    setProgress({ state: 'downloading', received: 0, total, percent: 0, path: target, source: url });
+
+    out = createWriteStream(part);
+    let received = 0;
+    const reader = res.body?.getReader?.();
+    if (reader) {
+      while (true) {
+        armIdle();
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.length;
+        out.write(Buffer.from(value));
+        setProgress({
+          state: 'downloading', received, total,
+          percent: total ? Math.min(100, Math.round(received / total * 100)) : 0,
+          path: target, source: url,
+        });
+      }
+    } else if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+      for await (const chunk of res.body) {
+        armIdle();
+        received += chunk.length;
+        out.write(Buffer.from(chunk));
+        setProgress({
+          state: 'downloading', received, total,
+          percent: total ? Math.min(100, Math.round(received / total * 100)) : 0,
+          path: target, source: url,
+        });
+      }
+    } else {
+      received = Buffer.from(await res.arrayBuffer()).length;
+      out.write(Buffer.alloc(0));
+    }
+    out.end();
+    await once(out, 'finish');
+    // A truncated body would otherwise install a broken binary.
+    if (total && received !== total) throw new Error('incomplete download (' + received + '/' + total + ' bytes)');
+    return { received, total };
+  } catch (err) {
+    if (out) { try { out.destroy(); } catch {} }
+    if (err && err.name === 'AbortError') {
+      throw new Error('timeout: no response within ' + (CONNECT_TIMEOUT_MS / 1000) + 's or no data for ' + (IDLE_TIMEOUT_MS / 1000) + 's');
+    }
+    throw err;
+  } finally {
+    clearTimeout(connectTimer);
+    clearTimeout(idleTimer);
+  }
+}
 
 function t(v) { return v === undefined || v === null ? '' : String(v); }
 function ok(data = {}) { return { ok: true, ...data }; }
@@ -524,62 +630,26 @@ async function dispatch(method, rawArgs = {}) {
       mkdirSync(CLOUDFLARED_CONFIG_DIR, { recursive: true });
       const target = path.join(CLOUDFLARED_CONFIG_DIR, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
       const part = target + '.part';
-      setProgress({ state: 'starting', received: 0, total: 0, percent: 0, path: target });
-      try {
-        const res = await fetch(url, { redirect: 'follow' });
-        if (!res.ok) { setProgress({ state: 'error', error: 'HTTP ' + res.status, received: 0, total: 0, percent: 0 }); return fail('Download failed with HTTP ' + res.status); }
-        const contentLength = parseInt(res.headers?.get?.('content-length') || '0', 10) || 0;
-        setProgress({ state: 'downloading', received: 0, total: contentLength, percent: 0, path: target });
-
-        const out = createWriteStream(part);
-        let received = 0;
-        const reader = res.body?.getReader?.();
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            received += value.length;
-            out.write(Buffer.from(value));
-            setProgress({
-              state: 'downloading', received, total: contentLength,
-              percent: contentLength ? Math.min(100, Math.round(received / contentLength * 100)) : 0,
-              path: target,
-            });
-          }
-          out.end();
-          await once(out, 'finish');
-        } else if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
-          for await (const chunk of res.body) {
-            received += chunk.length;
-            out.write(Buffer.from(chunk));
-            setProgress({
-              state: 'downloading', received, total: contentLength,
-              percent: contentLength ? Math.min(100, Math.round(received / contentLength * 100)) : 0,
-              path: target,
-            });
-          }
-          out.end();
-          await once(out, 'finish');
-        } else {
-          const buf = Buffer.from(await res.arrayBuffer());
-          out.end(buf);
-          await once(out, 'finish');
-          received = buf.length;
-        }
-        if (received < 100_000) {
+      const attempts = [];
+      for (const index of downloadOrder()) {
+        const sourceUrl = DOWNLOAD_SOURCES[index](url);
+        setProgress({ state: 'starting', received: 0, total: 0, percent: 0, path: target, source: sourceUrl });
+        try {
+          const { received, total } = await downloadTo(sourceUrl, part, target);
+          if (received < 100_000) throw new Error('downloaded file is too small (' + received + ' bytes)');
+          renameSync(part, target);
+          if (process.platform !== 'win32') { try { chmodSync(target, 0o755); } catch {} }
+          rememberSource(index);
+          setProgress({ state: 'done', received, total: total || received, percent: 100, path: target, source: sourceUrl });
+          return ok({ path: target, bytes: received, source: sourceUrl });
+        } catch (err) {
           try { unlinkSync(part); } catch {}
-          setProgress({ state: 'error', error: 'file too small', received, total: contentLength, percent: 0 });
-          return fail('Downloaded file is too small; aborting.');
+          attempts.push(sourceUrl + ' → ' + describeDownloadError(err));
         }
-        renameSync(part, target);
-        if (process.platform !== 'win32') { try { chmodSync(target, 0o755); } catch {} }
-        setProgress({ state: 'done', received, total: received, percent: 100, path: target });
-        return ok({ path: target, bytes: received });
-      } catch (err) {
-        try { unlinkSync(part); } catch {}
-        setProgress({ state: 'error', error: err.message, received: 0, total: 0, percent: 0 });
-        return fail(err.message);
       }
+      setProgress({ state: 'error', error: attempts.join('; '), received: 0, total: 0, percent: 0, path: target });
+      return fail('下载失败，已依次尝试 ' + attempts.length + ' 个源：' + attempts.join('；')
+        + '。若本机网络无法访问 GitHub，可手动下载 cloudflared 并放到 ' + target + '（记得 chmod +x）。');
     }
     case 'update':
       return dispatch('install', { ...args, token: t(args.token) || undefined });
