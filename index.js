@@ -28,7 +28,7 @@ const MAX_BODY = 64 * 1024;
 const DEFAULT_TIMEOUT = 30_000;
 const CONFIRM_TTL_MS = 5 * 60 * 1000; // confirmation tokens expire after 5 minutes
 
-export const inject = ['webServer', 'connection', 'tools'];
+export const inject = ['webServer', 'tools'];
 
 const managed = new Map();
 const confirmations = new Map();
@@ -886,18 +886,14 @@ const CLOUDFLARED_TOOL = {
 };
 
 export function apply(ctx) {
-  const connection = Reflect.get(ctx, 'connection');
-
+  // Admission is owned by the webServer: the route declares no `auth`, so it
+  // keeps the default `required` policy and every request is admitted (or
+  // refused) before the handler runs. DSH 0.2.2 removed the old
+  // `connection.requestRejection` check this plugin used to perform here.
   const disposeRoute = ctx.webServer.register({
     kind: 'exact',
     path: ROUTE_PATH,
     handler: async (req, res) => {
-      // Fail closed: if the auth service is unavailable, reject everything.
-      if (!connection || typeof connection.requestRejection !== 'function') {
-        res.statusCode = 401; res.end(); return;
-      }
-      const rejection = connection.requestRejection(req);
-      if (rejection !== undefined) { res.statusCode = rejection; res.end(); return; }
       if (req.method !== 'POST') {
         res.statusCode = 405;
         res.setHeader('allow', 'POST');

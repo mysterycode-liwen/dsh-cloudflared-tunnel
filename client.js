@@ -3,7 +3,10 @@
  * No JSX, no duplicate React, self-contained themed CSS, no external frameworks.
  */
 window.__ModuleLoader__.load({
-  id: '@local/cloudflared-tunnel/client',
+  // Must equal the boot-graph entry id (the package name). A `/client`
+  // suffix here registers the factory under a key the loader never looks
+  // up, so the sidebar icon and panel silently never appear.
+  id: '@local/cloudflared-tunnel',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
