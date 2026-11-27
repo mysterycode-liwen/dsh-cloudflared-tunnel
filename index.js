@@ -76,12 +76,25 @@ function rememberSource(index) {
   try { writeFileSync(SOURCE_MEMO_PATH, String(index) + '\n', 'utf8'); } catch {}
 }
 
+/** Mirrors that already failed in this process: a dead host stays dead for the
+ *  session, so the next install does not pay its connect timeout all over again. */
+const deadSources = new Set();
+
+function downloadOrderLive() {
+  const order = downloadOrder();
+  const alive = order.filter((i) => !deadSources.has(i));
+  return alive.length > 0 ? alive : order;
+}
+
 /** Stream one download attempt to `part`, reporting byte progress. Rejects on a
  *  connect timeout, a non-2xx status, an idle body, or a short body — so the
  *  caller can move on to the next mirror instead of hanging the panel. */
 async function downloadTo(url, part, target) {
   const controller = new AbortController();
-  const connectTimer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
+  // The connect budget covers the wait for response headers only. Once the body
+  // starts arriving, the idle timer is what guards it — keeping the connect timer
+  // armed would abort a slow-but-healthy 40 MB download halfway through.
+  let connectTimer = setTimeout(() => controller.abort(), CONNECT_TIMEOUT_MS);
   let idleTimer = null;
   const armIdle = () => {
     clearTimeout(idleTimer);
@@ -89,8 +102,9 @@ async function downloadTo(url, part, target) {
   };
   let out = null;
   try {
-    armIdle();
     const res = await fetch(url, { redirect: 'follow', signal: controller.signal });
+    clearTimeout(connectTimer);
+    connectTimer = null;
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const total = parseInt(res.headers?.get?.('content-length') || '0', 10) || 0;
     setProgress({ state: 'downloading', received: 0, total, percent: 0, path: target, source: url });
@@ -124,7 +138,7 @@ async function downloadTo(url, part, target) {
       }
     } else {
       received = Buffer.from(await res.arrayBuffer()).length;
-      out.write(Buffer.alloc(0));
+      out.end(Buffer.alloc(0));
     }
     out.end();
     await once(out, 'finish');
@@ -631,7 +645,7 @@ async function dispatch(method, rawArgs = {}) {
       const target = path.join(CLOUDFLARED_CONFIG_DIR, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
       const part = target + '.part';
       const attempts = [];
-      for (const index of downloadOrder()) {
+      for (const index of downloadOrderLive()) {
         const sourceUrl = DOWNLOAD_SOURCES[index](url);
         setProgress({ state: 'starting', received: 0, total: 0, percent: 0, path: target, source: sourceUrl });
         try {
@@ -640,10 +654,12 @@ async function dispatch(method, rawArgs = {}) {
           renameSync(part, target);
           if (process.platform !== 'win32') { try { chmodSync(target, 0o755); } catch {} }
           rememberSource(index);
+          deadSources.delete(index);
           setProgress({ state: 'done', received, total: total || received, percent: 100, path: target, source: sourceUrl });
           return ok({ path: target, bytes: received, source: sourceUrl });
         } catch (err) {
           try { unlinkSync(part); } catch {}
+          deadSources.add(index);
           attempts.push(sourceUrl + ' → ' + describeDownloadError(err));
         }
       }
