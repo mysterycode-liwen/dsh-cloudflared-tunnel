@@ -308,7 +308,8 @@ window.__ModuleLoader__.load({
           ),
           h('dl', { className: 'cf-dl' },
             h('dt', null, t('env.path')), h('dd', { className: 'cf-mono' }, status ? status.path : '…'),
-            h('dt', null, t('env.os')), h('dd', null, status ? status.platform : '…'),
+            h('dt', null, t('env.os')), h('dd', null, status ? status.platform + (status.arch ? ' / ' + status.arch : '') : '…'),
+            h('dt', null, t('env.asset')), h('dd', { className: 'cf-mono' }, status && status.asset ? status.asset : (status && status.supported === false ? t('env.unsupported') : '…')),
             h('dt', null, t('env.login')), h('dd', null, login ? (login.loggedIn ? t('env.loginYes') : t('env.loginNo')) : '…')
           ),
           (installing && progress) && h('div', { className: 'cf-progress-wrap' },
@@ -321,13 +322,13 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'cf-actions' },
             h('button', { className: 'cf-btn primary', disabled: busyAll, onClick: refreshEnv }, t('btn.refresh')),
-            !installed && h('button', { className: 'cf-btn', disabled: busyAll, onClick: doInstall }, t('env.install')),
+            !installed && h('button', { className: 'cf-btn', disabled: busyAll || (status && status.supported === false), onClick: doInstall }, t('env.install')),
             installed && h('button', { className: 'cf-btn', disabled: busyAll, onClick: doCheckUpdate }, t('env.update')),
             installed && h('button', { className: 'cf-btn', disabled: busyAll, onClick: doUpgrade }, t('env.upgrade')),
             h('button', { className: 'cf-btn', disabled: busyAll, onClick: doLogin }, t('env.loginAction')),
             h('button', { className: 'cf-btn', disabled: busyAll, onClick: () => doAction('openFolder', {}, t('common.confirm')) }, t('btn.openFolder'))
           ),
-          !installed && h('p', { className: 'cf-hint' }, t('env.installHint')),
+          !installed && h('p', { className: 'cf-hint' }, status && status.supported === false ? t('env.unsupportedHint') : t('env.installHint')),
           loginResult && loginResult.url && h('div', { className: 'cf-login-link' },
             h('p', { className: 'cf-hint' }, t('env.loginManual')),
             h('a', { className: 'cf-url', href: loginResult.url, target: '_blank', rel: 'noopener noreferrer' }, loginResult.url)

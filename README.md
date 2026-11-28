@@ -29,7 +29,7 @@ install_bundle target=<本目录绝对路径>
 
 ## 使用前提
 
-1. 在「环境」页安装 cloudflared CLI（Windows 会下载到 `~/.cloudflared/cloudflared.exe`）。
+1. 在「环境」页安装 cloudflared CLI。安装按操作系统与 CPU 架构选择官方产物：Windows → `~/.cloudflared/cloudflared.exe`，Linux → `~/.cloudflared/cloudflared`（x64/arm64/arm/386 分别对应），macOS 下载 `.tgz` 后自动解包。
 2. 点击「打开登录页面」完成 Cloudflare 授权，生成 `cert.pem`。
 3. 命名隧道相关操作（DNS 路由、Ingress、启动）需要已登录；快速隧道无需登录。
 

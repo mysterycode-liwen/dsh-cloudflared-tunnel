@@ -9,6 +9,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import https from 'node:https';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFile, chmodSync, createWriteStream, renameSync, unlinkSync } from 'node:fs';
 import { once } from 'node:events';
+import { gunzipSync } from 'node:zlib';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,11 +19,49 @@ const CERT_PATH = path.join(CLOUDFLARED_CONFIG_DIR, 'cert.pem');
 const CONFIG_PATH = path.join(CLOUDFLARED_CONFIG_DIR, 'config.yml');
 const LOG_DIR = path.join(CLOUDFLARED_CONFIG_DIR, 'plugin-logs');
 const ROUTE_PATH = '/__cloudflared_tunnel__/api';
+// Release asset per platform AND CPU architecture. Picking only by platform
+// installs an amd64 binary on an arm64 Linux box, which then fails to exec at
+// all ("exec format error"), so the arch is part of the lookup key.
+// Windows has no native arm64 build; the x64 binary runs under emulation there.
 const DOWNLOADS = {
-  win32: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe',
-  darwin: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tpl',
-  linux: 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64',
+  win32: {
+    x64: 'cloudflared-windows-amd64.exe',
+    arm64: 'cloudflared-windows-amd64.exe',
+    ia32: 'cloudflared-windows-386.exe',
+  },
+  darwin: {
+    x64: 'cloudflared-darwin-amd64.tgz',
+    arm64: 'cloudflared-darwin-arm64.tgz',
+  },
+  linux: {
+    x64: 'cloudflared-linux-amd64',
+    arm64: 'cloudflared-linux-arm64',
+    arm: 'cloudflared-linux-arm',
+    ia32: 'cloudflared-linux-386',
+  },
 };
+const RELEASE_BASE = 'https://github.com/cloudflare/cloudflared/releases/latest/download/';
+
+/** The release asset a given platform/arch should install, or null. */
+function releaseAsset(platform = process.platform, arch = process.arch) {
+  const table = DOWNLOADS[platform];
+  if (!table) return null;
+  // Fall back to x64 rather than failing: the x64 build still runs under
+  // emulation on arm64 Windows, and x64 is the safest bet on exotic arches.
+  const name = table[arch] || table.x64;
+  if (!name) return null;
+  return {
+    name,
+    url: RELEASE_BASE + name,
+    // macOS ships the binary inside a .tgz; Linux and Windows ship it bare.
+    archive: name.endsWith('.tgz') ? 'tgz' : '',
+    // Windows/macOS never chmod; only POSIX needs the +x bit.
+    executable: platform !== 'win32',
+  };
+}
+
+/** Filename cloudflared must have on this host to be executable. */
+function binName() { return process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared'; }
 // GitHub serves release binaries from release-assets.githubusercontent.com, which
 // some networks cannot reach at all: the TCP connect simply times out and fetch()
 // rejects with a bare "fetch failed". These mirrors proxy the very same release
@@ -84,6 +123,84 @@ function downloadOrderLive() {
   const order = downloadOrder();
   const alive = order.filter((i) => !deadSources.has(i));
   return alive.length > 0 ? alive : order;
+}
+
+/**
+ * Move a finished download into its final location, unpacking a macOS .tgz on
+ * the way. Windows refuses to rename over an existing file and a running
+ * connector keeps the old image locked, so that case gets a readable message
+ * instead of a bare errno.
+ */
+function placeDownloaded(staging, target, asset, platform = process.platform) {
+  // The macOS tarball always contains a single entry named `cloudflared`.
+  const entryName = 'cloudflared';
+  const writeTmp = target + '.tmp';
+  try {
+    if (asset.archive === 'tgz') {
+      const bin = extractFileFromTgz(readFileSync(staging), entryName);
+      if (!bin || bin.length < 100_000) throw new Error('no cloudflared binary inside ' + asset.name);
+      // Write beside the target first so a failed extract never leaves a
+      // half-written binary where the plugin expects a runnable one.
+      writeFileSync(writeTmp, bin);
+      if (platform === 'win32') { try { unlinkSync(target); } catch (err) { if (err.code !== 'ENOENT') throw err; } }
+      renameSync(writeTmp, target);
+      // The tarball itself is dead weight once its single entry is extracted.
+      try { unlinkSync(staging); } catch {}
+    } else if (platform === 'win32') {
+      // Windows cannot rename over an existing file.
+      try { unlinkSync(target); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      renameSync(staging, target);
+    } else {
+      renameSync(staging, target);
+    }
+  } catch (err) {
+    try { unlinkSync(writeTmp); } catch {}
+    throw lockedError(err);
+  }
+  if (asset.executable) { try { chmodSync(target, 0o755); } catch {} }
+}
+
+/** Turn "the file is in use / not writable" errnos into something actionable.
+ *  `local` marks the failure as a filesystem problem, not a bad download, so
+ *  the installer stops instead of blaming the next mirror. */
+function lockedError(err) {
+  if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+    const e = new Error('无法写入 ' + err.path + '：文件正被占用或没有权限，请先停止正在运行的 cloudflared 再安装');
+    e.local = true;
+    e.cause = err;
+    return e;
+  }
+  return err;
+}
+
+/**
+ * Pull a single file out of a .tar.gz buffer (macOS ships cloudflared that way).
+ * Only regular-file entries are considered; the release tarball holds exactly
+ * one file named `cloudflared`. Returns the file bytes, or null if not found.
+ */
+function extractFileFromTgz(buf, wanted) {
+  let raw;
+  try { raw = gunzipSync(buf); } catch (err) { throw new Error('corrupt .tgz archive: ' + err.message); }
+  let offset = 0;
+  while (offset + 512 <= raw.length) {
+    const header = raw.subarray(offset, offset + 512);
+    // An all-zero block marks the end of the archive.
+    if (header.every((b) => b === 0)) break;
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    const prefix = header.subarray(345, 500).toString('utf8').replace(/\0.*$/, '');
+    const fullName = prefix ? prefix + '/' + name : name;
+    const sizeField = header.subarray(124, 136).toString('utf8').replace(/\0.*$/, '').trim();
+    const size = parseInt(sizeField, 8) || 0;
+    const type = String.fromCharCode(header[156] || 48); // '0' or '\0' = regular file
+    const dataStart = offset + 512;
+    if ((type === '0' || type === '\0') && path.basename(fullName) === wanted) {
+      if (dataStart + size > raw.length) throw new Error('truncated .tgz entry');
+      return raw.subarray(dataStart, dataStart + size);
+    }
+    // Headers and data are both padded to a 512-byte boundary.
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  return null;
 }
 
 /** Stream one download attempt to `part`, reporting byte progress. Rejects on a
@@ -185,29 +302,48 @@ function normalizeHostHeader(v) {
   return s.trim();
 }
 
-function resolveBin() {
-  const candidates = process.platform === 'win32'
-    ? [path.join(CLOUDFLARED_CONFIG_DIR, 'cloudflared.exe'), path.join(os.homedir(), 'cloudflared.exe'), 'cloudflared']
-    : [path.join(CLOUDFLARED_CONFIG_DIR, 'cloudflared'), '/usr/local/bin/cloudflared', '/usr/bin/cloudflared', 'cloudflared'];
-  for (const c of candidates) {
-    if (c.includes(path.sep) && existsSync(c)) return c;
-  }
-  return 'cloudflared';
-}
-
-function commandOnPath(name) {
+/** Absolute path of `name` on PATH, honouring PATHEXT on Windows; '' if absent. */
+function findOnPath(name) {
   const pathVar = process.env.PATH || '';
   const exts = process.platform === 'win32'
-    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';')
+    ? (process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';').filter(Boolean)
     : [''];
   for (const dir of pathVar.split(path.delimiter)) {
     if (!dir) continue;
     for (const ext of exts) {
-      if (existsSync(path.join(dir, name + ext))) return true;
+      const full = path.join(dir, name + ext);
+      if (existsSync(full)) return full;
     }
   }
-  return false;
+  return '';
 }
+
+function resolveBin() {
+  // The plugin-managed copy always wins, so an install through the panel is
+  // what actually runs. Then the usual per-platform install locations, and
+  // finally whatever `cloudflared` the user already has on PATH.
+  const candidates = process.platform === 'win32'
+    ? [
+      path.join(CLOUDFLARED_CONFIG_DIR, 'cloudflared.exe'),
+      path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'cloudflared', 'cloudflared.exe'),
+      path.join(process.env.ProgramFiles || 'C:\\Program Files', 'cloudflared', 'cloudflared.exe'),
+      path.join(os.homedir(), 'cloudflared.exe'),
+    ]
+    : [
+      path.join(CLOUDFLARED_CONFIG_DIR, 'cloudflared'),
+      '/usr/local/bin/cloudflared',
+      '/usr/bin/cloudflared',
+      '/opt/homebrew/bin/cloudflared',
+      '/snap/bin/cloudflared',
+      path.join(os.homedir(), '.local', 'bin', 'cloudflared'),
+    ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return findOnPath('cloudflared') || 'cloudflared';
+}
+
+function commandOnPath(name) { return !!findOnPath(name); }
 function binaryAvailable() {
   const bin = resolveBin();
   return bin !== 'cloudflared' || commandOnPath('cloudflared');
@@ -587,7 +723,15 @@ async function dispatch(method, rawArgs = {}) {
         const r = await run(['--version'], { timeout: 10_000 });
         if (r.ok) version = (r.stdout || r.stderr).trim().split('\n')[0];
       } catch {}
-      return ok({ installed: !!version, version, path: bin, platform: process.platform, configDir: CLOUDFLARED_CONFIG_DIR });
+      const asset = releaseAsset();
+      return ok({
+        installed: !!version, version, path: bin,
+        platform: process.platform, arch: process.arch,
+        // What an install would fetch here, so the UI can show it up front.
+        asset: asset ? asset.name : '',
+        supported: !!asset,
+        configDir: CLOUDFLARED_CONFIG_DIR,
+      });
     }
     case 'loginStatus':
       return ok({ loggedIn: existsSync(CERT_PATH), certPath: CERT_PATH });
@@ -639,33 +783,47 @@ async function dispatch(method, rawArgs = {}) {
       } catch (err) { return fail(err.message); }
     }
     case 'install': {
-      const url = DOWNLOADS[process.platform];
-      if (!url) return fail('Automatic install is unsupported on ' + process.platform + '. Install manually from https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/');
+      const asset = releaseAsset();
+      if (!asset) {
+        return fail('未知平台 ' + process.platform + '/' + process.arch
+          + '，无法自动安装。请手动下载：https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/');
+      }
       mkdirSync(CLOUDFLARED_CONFIG_DIR, { recursive: true });
-      const target = path.join(CLOUDFLARED_CONFIG_DIR, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
-      const part = target + '.part';
+      const target = path.join(CLOUDFLARED_CONFIG_DIR, binName());
+      // A tarball is fetched to a staging path and unpacked afterwards; a bare
+      // binary is fetched straight to `.part` and renamed into place.
+      const staging = target + (asset.archive ? '.download' : '.part');
       const attempts = [];
       for (const index of downloadOrderLive()) {
-        const sourceUrl = DOWNLOAD_SOURCES[index](url);
+        const sourceUrl = DOWNLOAD_SOURCES[index](asset.url);
         setProgress({ state: 'starting', received: 0, total: 0, percent: 0, path: target, source: sourceUrl });
         try {
-          const { received, total } = await downloadTo(sourceUrl, part, target);
+          const { received, total } = await downloadTo(sourceUrl, staging, target);
           if (received < 100_000) throw new Error('downloaded file is too small (' + received + ' bytes)');
-          renameSync(part, target);
-          if (process.platform !== 'win32') { try { chmodSync(target, 0o755); } catch {} }
+          placeDownloaded(staging, target, asset);
           rememberSource(index);
           deadSources.delete(index);
           setProgress({ state: 'done', received, total: total || received, percent: 100, path: target, source: sourceUrl });
-          return ok({ path: target, bytes: received, source: sourceUrl });
+          return ok({ path: target, bytes: received, source: sourceUrl, asset: asset.name });
         } catch (err) {
-          try { unlinkSync(part); } catch {}
+          // A locked/permission-denied target is not the mirror's fault: trying
+          // the next source would just download 40 MB again to fail the same way.
+          if (err && err.local) {
+            setProgress({ state: 'error', error: err.message, received: 0, total: 0, percent: 0, path: target });
+            return fail(err.message);
+          }
           deadSources.add(index);
           attempts.push(sourceUrl + ' → ' + describeDownloadError(err));
+        } finally {
+          // Always drop the staging file: it is either already renamed into
+          // place (so it no longer exists) or a partial/corrupt leftover.
+          try { unlinkSync(staging); } catch {}
         }
       }
       setProgress({ state: 'error', error: attempts.join('; '), received: 0, total: 0, percent: 0, path: target });
       return fail('下载失败，已依次尝试 ' + attempts.length + ' 个源：' + attempts.join('；')
-        + '。若本机网络无法访问 GitHub，可手动下载 cloudflared 并放到 ' + target + '（记得 chmod +x）。');
+        + '。若本机网络无法访问 GitHub，可手动下载 ' + asset.name
+        + ' 并放到 ' + target + '（Linux/macOS 记得 chmod +x）。');
     }
     case 'update':
       return dispatch('install', { ...args, token: t(args.token) || undefined });
